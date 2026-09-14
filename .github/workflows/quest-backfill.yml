@@ -1,0 +1,165 @@
+name: Quest Backfill - Last 48 Hours
+
+# Uploading or editing this file on main sends one replay.
+# Use Run workflow to request another replay later.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/quest-backfill.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quest-backfill
+  cancel-in-progress: false
+
+jobs:
+  send-recent-quests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Send quests from the last 48 hours
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          """Replay quests that started in the last 48 hours without updating watcher state."""
+          
+          import argparse
+          import json
+          import os
+          import sys
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          
+          import requests
+          
+          sys.path.insert(0, "scripts")
+          
+          from quest_watch import QUEST_URL, build_embed, fetch_json
+          
+          
+          def parse_time(value):
+              parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+              if parsed.tzinfo is None:
+                  raise ValueError("Quest timestamps must include a timezone")
+              return parsed.astimezone(timezone.utc)
+          
+          
+          def select_recent(data, until):
+              if not isinstance(data, list):
+                  raise ValueError("Expected a list of quests from the source")
+              since = until - timedelta(hours=48)
+              selected = {}
+              for raw in data:
+                  cfg = raw.get("config") or raw
+                  try:
+                      started = parse_time(cfg.get("starts_at"))
+                  except (TypeError, ValueError):
+                      continue
+                  if raw.get("id") and since <= started <= until:
+                      selected[str(raw["id"])] = (started, {"id": str(raw["id"]), "config": cfg})
+              return [quest for _, quest in sorted(selected.values(), key=lambda item: (item[0], item[1]["id"]))]
+          
+          
+          def embed_length(embed):
+              size = len(embed.get("title", "")) + len(embed.get("description", ""))
+              size += len((embed.get("footer") or {}).get("text", ""))
+              size += len((embed.get("author") or {}).get("name", ""))
+              return size + sum(len(field["name"]) + len(field["value"]) for field in embed.get("fields", []))
+          
+          
+          def message_batches(quests):
+              batch, size = [], 0
+              for quest in quests:
+                  embed = build_embed(quest)
+                  name = (quest["config"].get("messages") or {}).get("quest_name", "Unknown Quest")
+                  embed["title"] = f"🕘 Last 48 hours: {name}"[:256]
+                  length = embed_length(embed)
+                  if length > 6000:
+                      raise ValueError("A quest exceeds Discord's embed text limit")
+                  if batch and (len(batch) == 10 or size + length > 6000):
+                      yield batch
+                      batch, size = [], 0
+                  batch.append(embed)
+                  size += length
+              if batch:
+                  yield batch
+          
+          
+          def send_batches(webhook_url, batches):
+              sent = 0
+              for batch in batches:
+                  # wait=true asks Discord to confirm that the message was created.
+                  try:
+                      response = requests.post(
+                          webhook_url,
+                          params={"wait": "true"},
+                          json={"embeds": batch, "allowed_mentions": {"parse": []}},
+                          timeout=30,
+                          allow_redirects=False,
+                      )
+                  except requests.RequestException as error:
+                      raise RuntimeError(f"Discord request failed ({type(error).__name__}); delivery may be uncertain") from None
+                  if response.status_code != 200:
+                      raise RuntimeError(f"Discord rejected the backfill batch (HTTP {response.status_code})")
+                  try:
+                      message_id = response.json().get("id")
+                  except (ValueError, AttributeError):
+                      message_id = None
+                  if not message_id:
+                      raise RuntimeError("Discord did not confirm a message ID; delivery may be uncertain")
+                  sent += len(batch)
+                  print(f"Discord confirmed message {message_id}: {len(batch)} quest(s).")
+              print(f"Backfill complete: {sent} quest(s) delivered.")
+              return sent
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument("--request", type=Path, help="Use the request's fixed UTC time window")
+              parser.add_argument("--dry-run", action="store_true", help="List matching quests without sending")
+              args = parser.parse_args()
+              until = datetime.now(timezone.utc)
+              if args.request:
+                  request = json.loads(args.request.read_text(encoding="utf-8"))
+                  until = parse_time(request["requested_at_utc"])
+              quests = select_recent(fetch_json(QUEST_URL), until)
+              print(f"Window: {(until - timedelta(hours=48)).isoformat()} through {until.isoformat()}")
+              for quest in quests:
+                  print(f"{quest['id']}: {(quest['config'].get('messages') or {}).get('quest_name', 'Unknown Quest')}")
+              # Prepare every batch before sending any messages, including in dry-run mode.
+              batches = list(message_batches(quests))
+              print(f"Selected {len(quests)} quest(s) in {len(batches)} message(s).")
+              if args.dry_run or not quests:
+                  return
+              webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+              if not webhook_url:
+                  raise RuntimeError("DISCORD_WEBHOOK_URL is not configured")
+              send_batches(webhook_url, batches)
+          
+          
+          if __name__ == "__main__":
+              try:
+                  main()
+              except requests.RequestException as error:
+                  print(f"Quest source request failed ({type(error).__name__})", file=sys.stderr)
+                  sys.exit(1)
+              except (RuntimeError, ValueError, OSError) as error:
+                  print(str(error), file=sys.stderr)
+                  sys.exit(1)
+          PY
