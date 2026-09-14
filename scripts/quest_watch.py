@@ -2,10 +2,12 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from functools import lru_cache
 
 import requests
 
 QUEST_URL = "https://raw.githubusercontent.com/xGustavvo/discord-api-tracker/refs/heads/main/quest.json"
+REGION_URL = "https://api.discordquest.com/api/regions"
 
 STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "known_quests.json")
 
@@ -38,6 +40,147 @@ FEATURE_NAMES = {
     18: "VIDEO_QUEST_FORCE_END_CARD_CTA_SWAP",
     # dont think any more is needed (for now)
 }
+
+
+# Names match the country selectors in VPN apps; UK is normalized to GB.
+COUNTRY_NAMES = {
+    "AE": ("United Arab Emirates", "الإمارات"),
+    "AR": ("Argentina", "الأرجنتين"),
+    "AT": ("Austria", "النمسا"),
+    "AU": ("Australia", "أستراليا"),
+    "BE": ("Belgium", "بلجيكا"),
+    "BR": ("Brazil", "البرازيل"),
+    "CA": ("Canada", "كندا"),
+    "CH": ("Switzerland", "سويسرا"),
+    "CL": ("Chile", "تشيلي"),
+    "CN": ("China", "الصين"),
+    "CO": ("Colombia", "كولومبيا"),
+    "CZ": ("Czechia", "التشيك"),
+    "DE": ("Germany", "ألمانيا"),
+    "DK": ("Denmark", "الدنمارك"),
+    "EG": ("Egypt", "مصر"),
+    "ES": ("Spain", "إسبانيا"),
+    "FI": ("Finland", "فنلندا"),
+    "FR": ("France", "فرنسا"),
+    "GB": ("United Kingdom", "بريطانيا"),
+    "GR": ("Greece", "اليونان"),
+    "HK": ("Hong Kong", "هونغ كونغ"),
+    "HU": ("Hungary", "المجر"),
+    "ID": ("Indonesia", "إندونيسيا"),
+    "IE": ("Ireland", "أيرلندا"),
+    "IL": ("Israel", "إسرائيل"),
+    "IN": ("India", "الهند"),
+    "IT": ("Italy", "إيطاليا"),
+    "JP": ("Japan", "اليابان"),
+    "KR": ("South Korea", "كوريا الجنوبية"),
+    "MX": ("Mexico", "المكسيك"),
+    "MY": ("Malaysia", "ماليزيا"),
+    "NL": ("Netherlands", "هولندا"),
+    "NO": ("Norway", "النرويج"),
+    "NZ": ("New Zealand", "نيوزيلندا"),
+    "PE": ("Peru", "بيرو"),
+    "PH": ("Philippines", "الفلبين"),
+    "PK": ("Pakistan", "باكستان"),
+    "PL": ("Poland", "بولندا"),
+    "PT": ("Portugal", "البرتغال"),
+    "RO": ("Romania", "رومانيا"),
+    "RU": ("Russia", "روسيا"),
+    "SA": ("Saudi Arabia", "السعودية"),
+    "SE": ("Sweden", "السويد"),
+    "SG": ("Singapore", "سنغافورة"),
+    "TH": ("Thailand", "تايلاند"),
+    "TR": ("Turkey", "تركيا"),
+    "TW": ("Taiwan", "تايوان"),
+    "UA": ("Ukraine", "أوكرانيا"),
+    "US": ("United States", "أمريكا"),
+    "VN": ("Vietnam", "فيتنام"),
+    "ZA": ("South Africa", "جنوب أفريقيا"),
+}
+
+
+def build_region_index(data):
+    rows = data.get("quests") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        raise ValueError("Invalid region data")
+    index = {
+        str(row["id"]): row
+        for row in rows
+        if isinstance(row, dict) and row.get("id")
+    }
+    # A replacement inherits the old record only when it has no own record.
+    for row in list(index.values()):
+        if row.get("replacement_id"):
+            index.setdefault(str(row["replacement_id"]), row)
+    return index
+
+
+@lru_cache(maxsize=1)
+def load_region_index():
+    try:
+        response = requests.get(REGION_URL, timeout=12)
+        response.raise_for_status()
+        return build_region_index(response.json())
+    except (requests.RequestException, ValueError, TypeError):
+        print("Region data unavailable; country labels will show Unknown.", file=sys.stderr)
+        return {}
+
+
+def normalize_country_codes(values):
+    if not isinstance(values, list):
+        return []
+    codes = set()
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        code = value.strip().upper()
+        code = {"UK": "GB", "EL": "GR"}.get(code, code)
+        if len(code) == 2 and code.isascii() and code.isalpha():
+            codes.add(code)
+    return sorted(codes)
+
+
+def country_label(code, bilingual=False):
+    flag = "".join(chr(127397 + ord(char)) for char in code)
+    english, arabic = COUNTRY_NAMES.get(code, (code, code))
+    if bilingual and arabic != english:
+        return f"{flag} {arabic} ({english})"
+    return f"{flag} {english}"
+
+
+def country_details(quest_id, region_index=None):
+    index = load_region_index() if region_index is None else region_index
+    record = index.get(str(quest_id))
+    unknown = ("❔ Unknown", "❔ غير معروف — بيانات الدولة غير متاحة حاليًا.")
+    if not isinstance(record, dict):
+        return unknown
+    regions = record.get("regions")
+    if isinstance(regions, list):
+        included = normalize_country_codes(regions)
+        excluded = []
+    elif isinstance(regions, dict):
+        included = normalize_country_codes(regions.get("include"))
+        excluded = normalize_country_codes(regions.get("exclude"))
+    else:
+        included, excluded = [], []
+    if included:
+        allowed = [code for code in included if code not in excluded]
+        if not allowed:
+            return unknown
+        short = " / ".join(country_label(code) for code in allowed[:3])
+        if len(allowed) > 3:
+            short += f" +{len(allowed) - 3}"
+        detail = "\n".join(country_label(code, bilingual=True) for code in allowed)
+        if len(allowed) > 1:
+            detail = "متاحة في إحدى هذه الدول:\n" + detail
+        return short, detail
+    if excluded:
+        detail = "\n".join(country_label(code, bilingual=True) for code in excluded)
+        if record.get("is_global") is True:
+            return "🌍 Global (exceptions)", "🌍 عالمية، باستثناء:\n" + detail
+        return "🌍 Region restrictions", "الدول المستثناة:\n" + detail + "\nالدول المتاحة غير محددة."
+    if record.get("is_global") is True:
+        return "🌍 Global", "🌍 عالمية (Global)"
+    return unknown
 
 
 def fetch_json(url):
@@ -124,7 +267,7 @@ def format_date_range(starts_at, expires_at):
         return "Unknown"
 
 
-def build_embed(quest):
+def build_embed(quest, region_index=None):
     qid = quest["id"]
     cfg = quest.get("config") or {}
     messages = cfg.get("messages") or {}
@@ -133,6 +276,12 @@ def build_embed(quest):
 
     # basic info about the quest
     name = messages.get("quest_name", "Unknown Quest")
+    country_title, country_text = country_details(qid, region_index)
+    if len(country_text) > 1024:
+        country_text = country_text[:1021] + "..."
+    title_suffix = f" | {country_title}"
+    quest_title = f"🆕 New Quest: {name}"
+    title = quest_title[:256 - len(title_suffix)] + title_suffix
     starts_at = cfg.get("starts_at")
     expires_at = cfg.get("expires_at")
 
@@ -175,6 +324,7 @@ def build_embed(quest):
 
     # embed fieldz
     fields = [
+        {"name": "🌍 Country / الدولة", "value": country_text, "inline": False},
         {"name": "Duration", "value": duration, "inline": False},
         {"name": "Game", "value": game_title, "inline": True},
         {"name": "Application", "value": app_id or "N/A", "inline": True},
@@ -188,7 +338,7 @@ def build_embed(quest):
         fields.insert(2, {"name": "Description", "value": extra_desc, "inline": False})
 
     embed = {
-        "title": f"🆕 New Quest: {name}",
+        "title": title,
         "url": f"https://discord.com/quests/{qid}",
         "color": 0x5865F2,
         "fields": fields,
@@ -204,13 +354,43 @@ def build_embed(quest):
     return embed
 
 
+def embed_text_length(embed):
+    total = len(embed.get("title", "")) + len(embed.get("description", ""))
+    total += len((embed.get("footer") or {}).get("text", ""))
+    total += len((embed.get("author") or {}).get("name", ""))
+    return total + sum(len(field["name"]) + len(field["value"]) for field in embed.get("fields", []))
+
+
+def webhook_batches(embeds):
+    batch, size = [], 0
+    for embed in embeds:
+        length = embed_text_length(embed)
+        if length > 6000:
+            raise ValueError("A quest exceeds Discord's embed text limit")
+        if batch and (len(batch) == 10 or size + length > 6000):
+            yield batch
+            batch, size = [], 0
+        batch.append(embed)
+        size += length
+    if batch:
+        yield batch
+
+
 def send_webhook(webhook_url, embeds):
-    CHUNK = 10
-    for i in range(0, len(embeds), CHUNK):
-        chunk = embeds[i:i + CHUNK]
-        resp = requests.post(webhook_url, json={"embeds": chunk}, timeout=30)
-        if resp.status_code >= 300:
-            print(f"Webhook error {resp.status_code}: {resp.text}", file=sys.stderr)
+    # Country lists count toward Discord's per-message embed text limit.
+    batches = list(webhook_batches(embeds))
+    for chunk in batches:
+        try:
+            resp = requests.post(
+                webhook_url,
+                json={"embeds": chunk, "allowed_mentions": {"parse": []}},
+                timeout=30,
+            )
+        except requests.RequestException as error:
+            raise RuntimeError(f"Discord request failed ({type(error).__name__})") from None
+        if not 200 <= resp.status_code < 300:
+            # Keep the previous state so an unsuccessful delivery can be retried.
+            raise RuntimeError(f"Discord webhook returned HTTP {resp.status_code}")
 
 
 def load_state():
